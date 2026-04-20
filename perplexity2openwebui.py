@@ -3,6 +3,7 @@ import re
 import uuid
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 INPUT_DIR = "."
 
@@ -14,19 +15,122 @@ def new_id():
 
 def clean_md(text: str) -> str:
     text = re.sub(r'<img[^>]*>\s*', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'<span[^>]*display\s*:\s*none[^>]*>.*?</span>', '', text, flags=re.IGNORECASE | re.DOTALL)
-    text = re.sub(r'<div[^>]*align\s*=\s*["\']?center["\']?[^>]*>\s*⁂\s*</div>', '', text, flags=re.IGNORECASE)
+
+    text = re.sub(
+        r'<span[^>]*display\s*:\s*none[^>]*>.*?</span>',
+        '',
+        text,
+        flags=re.IGNORECASE | re.DOTALL
+    )
+    text = re.sub(
+        r'<div[^>]*align\s*=\s*["\']?center["\']?[^>]*>\s*⁂\s*</div>',
+        '',
+        text,
+        flags=re.IGNORECASE
+    )
     text = re.sub(r'<div[^>]*>\s*⁂\s*</div>', '', text, flags=re.IGNORECASE)
+
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
+def clean_user_text(text: str) -> str:
+    text = text.strip()
+
+    text = re.sub(r'^\s*TITLE\s+', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\s+-\s+.*$', '', text)
+
+    text = re.sub(r'[ \t]{2,}', ' ', text)
+    text = re.sub(r'[ \t]+([.,;:!?])', r'\1', text)
+    return text.strip(" -\n\t")
+
+def pretty_domain(url: str) -> str:
+    try:
+        host = urlparse(url).netloc.lower()
+    except Exception:
+        return url
+    host = re.sub(r'^www\.', '', host)
+    return host or url
+
+def extract_footnotes(text: str):
+    footnotes = {}
+
+    pattern = re.compile(
+        r'(?m)^\[\^([^\]]+)\]:\s+(https?://\S+)\s*$'
+    )
+
+    for match in pattern.finditer(text):
+        footnotes[match.group(1)] = match.group(2).rstrip()
+
+    text_wo_footnotes = pattern.sub('', text)
+    return text_wo_footnotes.strip(), footnotes
+
+def replace_footnote_refs(text: str, footnotes: dict):
+    ref_pattern = re.compile(r'(?:\[\^([^\]]+)\])+')
+
+    def repl(match):
+        refs = re.findall(r'\[\^([^\]]+)\]', match.group(0))
+        urls = []
+        seen = set()
+
+        for ref in refs:
+            url = footnotes.get(ref)
+            if url and url not in seen:
+                urls.append(url)
+                seen.add(url)
+
+        if not urls:
+            return ''
+
+        links = []
+        for url in urls:
+            label = pretty_domain(url)
+            links.append(f'[{label}]({url})')
+
+        return " (Sources: " + ", ".join(links) + ")"
+
+    return ref_pattern.sub(repl, text)
+
 def clean_assistant_text(text: str) -> str:
-    text = re.sub(r'<span[^>]*display\s*:\s*none[^>]*>.*?</span>', '', text, flags=re.IGNORECASE | re.DOTALL)
-    text = re.sub(r'<div[^>]*align\s*=\s*["\']?center["\']?[^>]*>\s*⁂\s*</div>', '', text, flags=re.IGNORECASE)
+    text = text.strip()
+
+    # Remove real HTML leftovers
+    text = re.sub(
+        r'<span[^>]*display\s*:\s*none[^>]*>.*?</span>',
+        '',
+        text,
+        flags=re.IGNORECASE | re.DOTALL
+    )
+    text = re.sub(
+        r'<div[^>]*align\s*=\s*["\']?center["\']?[^>]*>\s*⁂\s*</div>',
+        '',
+        text,
+        flags=re.IGNORECASE
+    )
     text = re.sub(r'<div[^>]*>\s*⁂\s*</div>', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'</?(span|div)[^>]*>', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'<sup[^>]*>.*?</sup>', '', text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r'</?(span|div|sup)[^>]*>', '', text, flags=re.IGNORECASE)
+
+    # Remove plaintext export leftovers
+    text = re.sub(r'\bspan\s+styledisplaynone[\d_]*span\b', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\bdiv\s+aligncenterdiv\b', '', text, flags=re.IGNORECASE)
+
+    # Convert Perplexity footnote refs into visible clickable inline Markdown links
+    text, footnotes = extract_footnotes(text)
+    text = replace_footnote_refs(text, footnotes)
+
+    # Remove remaining raw citation junk if any survived
+    text = re.sub(r'(?<!`)\b\d+(?:_\d+){1,}\b(?!`)', '', text)
+    text = re.sub(r'(?<=[A-Za-z).,!?:;\]])\d{4,}\b', '', text)
+    text = re.sub(r'(?<!`)\[(\d{1,3})\](?!`)', '', text)
+    text = re.sub(r'(?m)^\s*\d+(?:[_\d]*)\s*$', '', text)
+    text = re.sub(r'(?m)^\s*\d+\s+https\S+\s*$', '', text)
+
+    # Tidy spacing
+    text = re.sub(r'[ \t]+([.,;:!?])', r'\1', text)
     text = re.sub(r'[ \t]+\n', '\n', text)
-    text = re.sub(r'\n{3,}', '\n\n', text)
+    text = re.sub(r'[ \t]{2,}', ' ', text)
+    text = re.sub(r'\n[ \t]*\n[ \t]*\n+', '\n\n', text)
+
     return text.strip()
 
 def parse_turns(md: str):
@@ -35,11 +139,11 @@ def parse_turns(md: str):
     turns = []
 
     for section in sections:
-        m = re.match(r'^#\s+(.+?)\n+(.*)$', section, flags=re.DOTALL)
+        m = re.match(r'^(?:#\s+|TITLE\s+)(.+?)\n+(.*)$', section, flags=re.DOTALL | re.IGNORECASE)
         if not m:
             continue
 
-        user_text = m.group(1).strip()
+        user_text = clean_user_text(m.group(1).strip())
         assistant_text = clean_assistant_text(m.group(2).strip())
 
         if not user_text:
